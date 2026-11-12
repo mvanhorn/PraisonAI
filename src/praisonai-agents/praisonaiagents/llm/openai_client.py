@@ -2324,13 +2324,25 @@ class OpenAIClient:
                 if _native_batch_parallel_ok(parallel_tool_calls, _specs):
                     import concurrent.futures
                     from ..trace.context_events import copy_context_to_callable
+
+                    def _run_captured(spec):
+                        # Hold ToolExecutionError so every sibling finishes and
+                        # its (deferred) result is registered before re-raising.
+                        try:
+                            return _run_tool(spec)
+                        except ToolExecutionError as exc:
+                            return exc
+
                     with concurrent.futures.ThreadPoolExecutor(
                         max_workers=min(_NATIVE_PARALLEL_TOOL_WORKERS, len(_specs))
                     ) as _pool:
-                        _futures = [_pool.submit(copy_context_to_callable(_run_tool), s) for s in _specs]
+                        _futures = [_pool.submit(copy_context_to_callable(_run_captured), s) for s in _specs]
                         _results = iter([f.result() for f in _futures])
                 else:
-                    _results = iter([_run_tool(s) for s in _specs])
+                    # Lazy: each call runs (and registers any deferred result)
+                    # before the next one starts, exactly as before.
+                    _results = (_run_tool(s) for s in _specs)
+                _batch_error = None
 
                 for tool_call, function_name, arguments, _tool_call_id, err in _parsed:
                     if err is not None:
@@ -2345,6 +2357,9 @@ class OpenAIClient:
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
                     tool_result = next(_results)
+                    if isinstance(tool_result, ToolExecutionError):
+                        _batch_error = _batch_error or tool_result
+                        continue
                     # Parity with the LiteLLM loop: register a deferred handle so
                     # its eventual background value is re-injected, not lost.
                     tool_result = _handle_native_deferred_result(
@@ -2378,6 +2393,8 @@ class OpenAIClient:
                             "content": results_str
                         })
 
+                if _batch_error is not None:
+                    raise _batch_error
                 if _deferred_media_followups:
                     messages.extend(_deferred_media_followups)
                 
@@ -2719,12 +2736,20 @@ class OpenAIClient:
                     _sem = asyncio.Semaphore(_NATIVE_PARALLEL_TOOL_WORKERS)
 
                     async def _bounded(spec):
+                        # Hold ToolExecutionError so every sibling finishes and
+                        # its (deferred) result is registered before re-raising.
                         async with _sem:
-                            return await _arun_tool(*spec)
+                            try:
+                                return await _arun_tool(*spec)
+                            except ToolExecutionError as exc:
+                                return exc
 
                     _results = iter(await asyncio.gather(*(_bounded(s) for s in _specs)))
                 else:
-                    _results = iter([await _arun_tool(*s) for s in _specs])
+                    # Sequential: run each call in the loop below so it registers
+                    # any deferred result before the next one starts.
+                    _results = None
+                _batch_error = None
 
                 for tool_call, function_name, arguments, _tool_call_id, err in _parsed:
                     if err is not None:
@@ -2738,7 +2763,13 @@ class OpenAIClient:
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
-                    tool_result = next(_results)
+                    tool_result = (
+                        next(_results) if _results is not None
+                        else await _arun_tool(function_name, arguments, _tool_call_id)
+                    )
+                    if isinstance(tool_result, ToolExecutionError):
+                        _batch_error = _batch_error or tool_result
+                        continue
 
                     # Parity with the LiteLLM loop: register a deferred handle so
                     # its eventual background value is re-injected, not lost.
@@ -2767,6 +2798,8 @@ class OpenAIClient:
                             "content": results_str
                         })
 
+                if _batch_error is not None:
+                    raise _batch_error
                 if _deferred_media_followups:
                     messages.extend(_deferred_media_followups)
                 

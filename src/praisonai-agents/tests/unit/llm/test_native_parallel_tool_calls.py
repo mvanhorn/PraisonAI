@@ -155,3 +155,67 @@ def test_parallel_tool_error_and_bad_json_reported_in_order(monkeypatch):
     assert json.loads(tool_msgs[0]["content"]) == {"error": "boom"}
     assert "Invalid arguments JSON" in tool_msgs[1]["content"]
     assert json.loads(tool_msgs[2]["content"]) == "ok"
+
+
+def _record_registered(monkeypatch):
+    import praisonaiagents.llm.openai_client as oc
+    registered = []
+    real = oc._handle_native_deferred_result
+
+    def spy(tool_result, messages, tool_call_id, *a, **kw):
+        registered.append(tool_call_id)
+        return real(tool_result, messages, tool_call_id, *a, **kw)
+
+    monkeypatch.setattr(oc, "_handle_native_deferred_result", spy)
+    return registered
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_sequential_registers_each_result_before_next_call(monkeypatch, use_async):
+    from praisonaiagents.errors import ToolExecutionError
+    seen, ran = [], []
+    c = _client(monkeypatch, [_call(0), _call(1), _call(2)], seen)
+    registered = _record_registered(monkeypatch)
+
+    def execute_tool_fn(name, args, **kw):
+        ran.append(args["i"])
+        if args["i"] == 1:
+            raise ToolExecutionError("fatal", tool_name=name)
+        return "ok"
+
+    kwargs = dict(messages=[{"role": "user", "content": "go"}], tools=[],
+                  execute_tool_fn=execute_tool_fn, stream=True, verbose=False,
+                  max_iterations=3)
+    with pytest.raises(ToolExecutionError):
+        if use_async:
+            asyncio.run(c.achat_completion_with_tools(**kwargs))
+        else:
+            c.chat_completion_with_tools(**kwargs)
+    assert ran == [0, 1]  # call_2 never started
+    assert registered == ["call_0"]  # call_0 registered before call_1 failed
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_parallel_fatal_error_waits_for_and_registers_siblings(monkeypatch, use_async):
+    from praisonaiagents.errors import ToolExecutionError
+    seen, finished = [], []
+    c = _client(monkeypatch, [_call(0), _call(1)], seen)
+    registered = _record_registered(monkeypatch)
+
+    def execute_tool_fn(name, args, **kw):
+        if args["i"] == 0:
+            raise ToolExecutionError("fatal", tool_name=name)
+        threading.Event().wait(0.1)
+        finished.append(args["i"])
+        return "ok"
+
+    kwargs = dict(messages=[{"role": "user", "content": "go"}], tools=[],
+                  execute_tool_fn=execute_tool_fn, stream=True, verbose=False,
+                  max_iterations=3, parallel_tool_calls=True)
+    with pytest.raises(ToolExecutionError):
+        if use_async:
+            asyncio.run(c.achat_completion_with_tools(**kwargs))
+        else:
+            c.chat_completion_with_tools(**kwargs)
+    assert finished == [1]  # sibling completed before the error propagated
+    assert registered == ["call_1"]
