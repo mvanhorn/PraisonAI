@@ -2075,9 +2075,6 @@ class OpenAIClient:
         # jobs usually complete after this loop returns, so late results must
         # land in a list a subsequent turn replays — not the per-call copy below.
         deferred_history_sink = kwargs.pop("deferred_history_sink", None)
-        # Opt-in concurrent execution of a batch of tool calls
-        # (ExecutionConfig.parallel_tool_calls); a loop setting, not an API param.
-        parallel_tool_calls = bool(kwargs.pop("parallel_tool_calls", False))
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
@@ -2295,56 +2292,12 @@ class OpenAIClient:
                 # Collect media-bearing follow-ups to flush after all tool
                 # replies for this turn (keeps tool replies consecutive).
                 _deferred_media_followups = []
-                # Handle both ToolCall dataclass and OpenAI object.
-                # Guard the parse itself so malformed/truncated argument
-                # JSON is reported back to the model instead of aborting
-                # the whole run (matches chat_completion_with_tools_stream).
-                _parsed = [(tc, *_extract_tool_call_name_and_args(tc)) for tc in tool_calls]
-                _specs = [(n, a, t) for _, n, a, t, e in _parsed if e is None]
-
-                def _run_tool(spec, _iteration=iteration_count):
-                    # Execute the tool (pass tool_call_id for event correlation).
-                    # Capture failures and report them back to the model instead of
-                    # aborting the whole run (safe-by-default, matching the streaming
-                    # path chat_completion_with_tools_stream).
-                    name, args, tcid = spec
-                    try:
-                        return execute_tool_fn(
-                            name,
-                            args,
-                            tool_call_id=tcid,
-                            **_durable_iteration_kwargs(execute_tool_fn, _iteration),
-                        )
-                    except ToolExecutionError:
-                        raise
-                    except Exception as tool_error:
-                        logging.warning(f"Tool '{name}' failed: {tool_error}")
-                        return {"error": str(tool_error)}
-
-                if _native_batch_parallel_ok(parallel_tool_calls, _specs):
-                    import concurrent.futures
-                    from ..trace.context_events import copy_context_to_callable
-
-                    def _run_captured(spec):
-                        # Hold ToolExecutionError so every sibling finishes and
-                        # its (deferred) result is registered before re-raising.
-                        try:
-                            return _run_tool(spec)
-                        except ToolExecutionError as exc:
-                            return exc
-
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(_NATIVE_PARALLEL_TOOL_WORKERS, len(_specs))
-                    ) as _pool:
-                        _futures = [_pool.submit(copy_context_to_callable(_run_captured), s) for s in _specs]
-                        _results = iter([f.result() for f in _futures])
-                else:
-                    # Lazy: each call runs (and registers any deferred result)
-                    # before the next one starts, exactly as before.
-                    _results = (_run_tool(s) for s in _specs)
-                _batch_error = None
-
-                for tool_call, function_name, arguments, _tool_call_id, err in _parsed:
+                for tool_call in tool_calls:
+                    # Handle both ToolCall dataclass and OpenAI object.
+                    # Guard the parse itself so malformed/truncated argument
+                    # JSON is reported back to the model instead of aborting
+                    # the whole run (matches chat_completion_with_tools_stream).
+                    function_name, arguments, _tool_call_id, err = _extract_tool_call_name_and_args(tool_call)
                     if err is not None:
                         logging.warning(f"Failed to parse tool call arguments: {err}")
                         messages.append({
@@ -2353,13 +2306,28 @@ class OpenAIClient:
                             "content": json.dumps({"error": f"Invalid arguments JSON: {err}"}),
                         })
                         continue
-
+                    
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
-                    tool_result = next(_results)
-                    if isinstance(tool_result, ToolExecutionError):
-                        _batch_error = _batch_error or tool_result
-                        continue
+                    
+                    # Execute the tool (pass tool_call_id for event correlation).
+                    # Capture failures and report them back to the model instead of
+                    # aborting the whole run (safe-by-default, matching the streaming
+                    # path chat_completion_with_tools_stream).
+                    try:
+                        tool_result = execute_tool_fn(
+                            function_name,
+                            arguments,
+                            tool_call_id=_tool_call_id,
+                            **_durable_iteration_kwargs(
+                                execute_tool_fn, iteration_count
+                            ),
+                        )
+                    except ToolExecutionError:
+                        raise
+                    except Exception as tool_error:
+                        logging.warning(f"Tool '{function_name}' failed: {tool_error}")
+                        tool_result = {"error": str(tool_error)}
                     # Parity with the LiteLLM loop: register a deferred handle so
                     # its eventual background value is re-injected, not lost.
                     tool_result = _handle_native_deferred_result(
@@ -2393,8 +2361,6 @@ class OpenAIClient:
                             "content": results_str
                         })
 
-                if _batch_error is not None:
-                    raise _batch_error
                 if _deferred_media_followups:
                     messages.extend(_deferred_media_followups)
                 

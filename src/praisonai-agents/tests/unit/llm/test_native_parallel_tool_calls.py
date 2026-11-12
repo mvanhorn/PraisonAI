@@ -1,6 +1,6 @@
 """
 ExecutionConfig.parallel_tool_calls on the native OpenAI client tool loop
-(openai_client.{a,}chat_completion_with_tools), issue #6338.
+(openai_client.achat_completion_with_tools), issue #6338.
 
 The model call is mocked; a threading.Barrier proves the batch really runs
 concurrently (a sequential run would break the barrier).
@@ -62,40 +62,25 @@ def _barrier_tool(n):
     return execute_tool_fn
 
 
-def _run_sync(c, fn, parallel):
+def _run(c, fn, parallel=None):
     kwargs = dict(
         messages=[{"role": "user", "content": "go"}], tools=[], execute_tool_fn=fn,
         stream=True, verbose=False, max_iterations=3,
     )
     if parallel is not None:
         kwargs["parallel_tool_calls"] = parallel
-    return c.chat_completion_with_tools(**kwargs)
-
-
-def test_sync_parallel_runs_concurrently_and_keeps_order(monkeypatch):
-    seen = []
-    c = _client(monkeypatch, [_call(0), _call(1), _call(2)], seen)
-    _run_sync(c, _barrier_tool(3), parallel=True)
-
-    tool_msgs = _tool_messages(seen[1])
-    assert [m["tool_call_id"] for m in tool_msgs] == ["call_0", "call_1", "call_2"]
-    assert [json.loads(m["content"]) for m in tool_msgs] == ["r0", "r1", "r2"]
-    # Loop setting only: never forwarded to the API request.
-    assert all("parallel_tool_calls" not in k for k in seen)
+    return asyncio.run(c.achat_completion_with_tools(**kwargs))
 
 
 def test_async_parallel_runs_concurrently_and_keeps_order(monkeypatch):
     seen = []
     c = _client(monkeypatch, [_call(0), _call(1), _call(2)], seen)
-    asyncio.run(c.achat_completion_with_tools(
-        messages=[{"role": "user", "content": "go"}], tools=[],
-        execute_tool_fn=_barrier_tool(3), stream=True, verbose=False,
-        max_iterations=3, parallel_tool_calls=True,
-    ))
+    _run(c, _barrier_tool(3), parallel=True)
 
     tool_msgs = _tool_messages(seen[1])
     assert [m["tool_call_id"] for m in tool_msgs] == ["call_0", "call_1", "call_2"]
     assert [json.loads(m["content"]) for m in tool_msgs] == ["r0", "r1", "r2"]
+    # Loop setting only: never forwarded to the API request.
     assert all("parallel_tool_calls" not in k for k in seen)
 
 
@@ -120,7 +105,7 @@ def test_default_stays_sequential(monkeypatch, parallel):
     seen = []
     c = _client(monkeypatch, [_call(0), _call(1), _call(2)], seen)
     fn, state = _concurrency_probe()
-    _run_sync(c, fn, parallel=parallel)
+    _run(c, fn, parallel=parallel)
     assert state["max"] == 1
     assert len(_tool_messages(seen[1])) == 3
 
@@ -133,7 +118,7 @@ def test_write_conflict_forces_sequential(monkeypatch):
     ]
     c = _client(monkeypatch, batch, seen)
     fn, state = _concurrency_probe()
-    _run_sync(c, fn, parallel=True)
+    _run(c, fn, parallel=True)
     assert state["max"] == 1
     assert [m["tool_call_id"] for m in _tool_messages(seen[1])] == ["call_0", "call_1"]
 
@@ -149,7 +134,7 @@ def test_parallel_tool_error_and_bad_json_reported_in_order(monkeypatch):
             raise RuntimeError("boom")
         return "ok"
 
-    _run_sync(c, execute_tool_fn, parallel=True)
+    _run(c, execute_tool_fn, parallel=True)
     tool_msgs = _tool_messages(seen[1])
     assert [m["tool_call_id"] for m in tool_msgs] == ["call_0", "call_bad", "call_2"]
     assert json.loads(tool_msgs[0]["content"]) == {"error": "boom"}
@@ -170,8 +155,7 @@ def _record_registered(monkeypatch):
     return registered
 
 
-@pytest.mark.parametrize("use_async", [False, True])
-def test_sequential_registers_each_result_before_next_call(monkeypatch, use_async):
+def test_sequential_registers_each_result_before_next_call(monkeypatch):
     from praisonaiagents.errors import ToolExecutionError
     seen, ran = [], []
     c = _client(monkeypatch, [_call(0), _call(1), _call(2)], seen)
@@ -183,20 +167,13 @@ def test_sequential_registers_each_result_before_next_call(monkeypatch, use_asyn
             raise ToolExecutionError("fatal", tool_name=name)
         return "ok"
 
-    kwargs = dict(messages=[{"role": "user", "content": "go"}], tools=[],
-                  execute_tool_fn=execute_tool_fn, stream=True, verbose=False,
-                  max_iterations=3)
     with pytest.raises(ToolExecutionError):
-        if use_async:
-            asyncio.run(c.achat_completion_with_tools(**kwargs))
-        else:
-            c.chat_completion_with_tools(**kwargs)
+        _run(c, execute_tool_fn)
     assert ran == [0, 1]  # call_2 never started
     assert registered == ["call_0"]  # call_0 registered before call_1 failed
 
 
-@pytest.mark.parametrize("use_async", [False, True])
-def test_parallel_fatal_error_waits_for_and_registers_siblings(monkeypatch, use_async):
+def test_parallel_fatal_error_waits_for_and_registers_siblings(monkeypatch):
     from praisonaiagents.errors import ToolExecutionError
     seen, finished = [], []
     c = _client(monkeypatch, [_call(0), _call(1)], seen)
@@ -209,13 +186,7 @@ def test_parallel_fatal_error_waits_for_and_registers_siblings(monkeypatch, use_
         finished.append(args["i"])
         return "ok"
 
-    kwargs = dict(messages=[{"role": "user", "content": "go"}], tools=[],
-                  execute_tool_fn=execute_tool_fn, stream=True, verbose=False,
-                  max_iterations=3, parallel_tool_calls=True)
     with pytest.raises(ToolExecutionError):
-        if use_async:
-            asyncio.run(c.achat_completion_with_tools(**kwargs))
-        else:
-            c.chat_completion_with_tools(**kwargs)
+        _run(c, execute_tool_fn, parallel=True)
     assert finished == [1]  # sibling completed before the error propagated
     assert registered == ["call_1"]
