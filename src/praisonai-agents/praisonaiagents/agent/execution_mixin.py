@@ -1966,8 +1966,11 @@ Write the complete compiled report:"""
                     durable_key = None
                 call_arguments = arguments
                 if durable_key:
+                    sig_target = (
+                        func._signature_target() if isinstance(func, BaseTool) else call_target
+                    )
                     try:
-                        parameters = inspect.signature(call_target).parameters.values()
+                        parameters = inspect.signature(sig_target).parameters.values()
                     except (TypeError, ValueError):
                         parameters = ()
                     if any(
